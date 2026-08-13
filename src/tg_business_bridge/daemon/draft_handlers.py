@@ -1,11 +1,22 @@
 import asyncio
+import json
 import logging
 import sqlite3
 import time
+from urllib.parse import quote
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramRetryAfter
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    WebAppInfo,
+)
 
 from tg_business_bridge import db
 from tg_business_bridge.config import Settings
@@ -15,11 +26,13 @@ log = logging.getLogger(__name__)
 router = Router()
 
 
-def _card_markup(draft_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Отправить", callback_data=f"draft:{draft_id}:approve"),
-        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"draft:{draft_id}:reject"),
-    ]])
+def _card_markup(draft_id: int, settings: Settings) -> InlineKeyboardMarkup:
+    buttons = [InlineKeyboardButton(text="✅ Отправить", callback_data=f"draft:{draft_id}:approve")]
+    if settings.editor_url:
+        buttons.append(
+            InlineKeyboardButton(text="✏️ Редактировать", callback_data=f"draft:{draft_id}:edit")
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
 
 
 _CARD_LIMIT = 3500
@@ -50,11 +63,12 @@ def _contact_name(conn: sqlite3.Connection, chat_id: int) -> str:
 
 async def _send_card(
     bot: Bot, conn: sqlite3.Connection, connection: sqlite3.Row, draft: sqlite3.Row,
+    settings: Settings,
 ) -> None:
     contact = _contact_name(conn, draft["chat_id"])
     text = _card_text(draft, contact)
     sent = await bot.send_message(
-        chat_id=connection["owner_id"], text=text, reply_markup=_card_markup(draft["id"])
+        chat_id=connection["owner_id"], text=text, reply_markup=_card_markup(draft["id"], settings)
     )
     db.set_draft_card(conn, draft["id"], sent.message_id)
     db.set_draft_status(conn, draft["id"], "awaiting")
@@ -87,7 +101,7 @@ async def process_new_drafts(bot: Bot, conn: sqlite3.Connection, settings: Setti
     if time.monotonic() >= _flood_wait_until:
         for draft in db.get_drafts_by_status(conn, "pending"):
             try:
-                await _send_card(bot, conn, connection, draft)
+                await _send_card(bot, conn, connection, draft, settings)
             except TelegramRetryAfter as exc:
                 _flood_wait_until = time.monotonic() + exc.retry_after
                 log.warning(
@@ -139,7 +153,9 @@ async def watch_drafts(
 
 
 @router.callback_query(F.data.startswith("draft:"))
-async def on_draft_callback(cb: CallbackQuery, conn: sqlite3.Connection, bot: Bot) -> None:
+async def on_draft_callback(
+    cb: CallbackQuery, conn: sqlite3.Connection, bot: Bot, settings: Settings,
+) -> None:
     # Validate callback data format before any DB operations
     parts = cb.data.split(":")
     if len(parts) != 3:
@@ -153,8 +169,9 @@ async def on_draft_callback(cb: CallbackQuery, conn: sqlite3.Connection, bot: Bo
         await cb.answer()
         return
 
-    # Validate action is in allowed set
-    if action not in {"approve", "reject"}:
+    # Validate action is in allowed set ('reject' — с карточек, разосланных до появления
+    # кнопки «Редактировать»: они должны продолжать работать)
+    if action not in {"approve", "reject", "edit"}:
         await cb.answer()
         return
 
@@ -166,7 +183,35 @@ async def on_draft_callback(cb: CallbackQuery, conn: sqlite3.Connection, bot: Bo
     if draft is None or draft["status"] != "awaiting":
         await cb.answer("Черновик уже обработан")
         return
-    if action == "approve":
+    if action == "edit":
+        if not settings.editor_url:
+            # карточка могла быть разослана до того, как редактор выключили
+            await cb.answer("Редактор недоступен")
+            return
+        # sendData умеет только web_app-кнопка reply-клавиатуры, поэтому редактор
+        # открывается вторым шагом. Статус не трогаем: черновик остаётся 'awaiting',
+        # владелец может передумать и отправить его с карточки как есть.
+        url = f"{settings.editor_url}#id={draft_id}&text={quote(draft['text'])}"
+        try:
+            await bot.send_message(
+                chat_id=cb.message.chat.id,
+                text=f"✏️ Редактирование черновика №{draft_id} — открой редактор кнопкой ниже",
+                reply_markup=ReplyKeyboardMarkup(
+                    keyboard=[[
+                        KeyboardButton(text="✏️ Открыть редактор", web_app=WebAppInfo(url=url))
+                    ]],
+                    resize_keyboard=True, one_time_keyboard=True,
+                ),
+            )
+        except Exception as exc:  # noqa: BLE001 - без ответа на callback юзер видит вечный спиннер
+            # длинный черновик после urlencode раздувает URL кнопки — Telegram может его не принять
+            log.warning("не удалось открыть редактор черновика %s: %s", draft_id, exc)
+            await cb.answer(
+                "Не удалось открыть редактор — черновик слишком длинный или произошла ошибка"
+            )
+            return
+        await cb.answer()
+    elif action == "approve":
         # Порядок обязателен: карточку правим в ⏳ ДО флипа в 'approved'. Как только статус
         # станет 'approved', вотчер может успеть отправить черновик и поставить финальное
         # «✅ Отправлено» — запоздавшая правка ⏳ перекрыла бы его. Гвардированный флип
@@ -196,3 +241,55 @@ async def on_draft_callback(cb: CallbackQuery, conn: sqlite3.Connection, bot: Bo
             await cb.message.edit_text(text=cb.message.text + "\n\n❌ Отклонено", reply_markup=None)
         except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
             log.warning("не удалось отредактировать карточку черновика %s: %s", draft_id, exc)
+
+
+def _parse_editor_payload(raw: str) -> tuple[int, str] | None:
+    """(draft_id, text) из данных мини-приложения или None, если пришёл мусор.
+    Сам текст никогда не попадает в логи — это личная переписка."""
+    try:
+        payload = json.loads(raw)
+        draft_id_s = str(payload["id"])
+        text = payload["text"]
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not draft_id_s.isdigit() or not isinstance(text, str) or not text.strip():
+        return None
+    if len(text) > 4096:  # Telegram не примет такой ответ при отправке
+        return None
+    return int(draft_id_s), text
+
+
+@router.message(F.web_app_data)
+async def on_editor_result(
+    msg: Message, conn: sqlite3.Connection, bot: Bot, settings: Settings,
+) -> None:
+    connection = db.get_enabled_connection(conn)
+    if connection is None or msg.from_user is None:
+        return
+    if msg.from_user.id != connection["owner_id"]:
+        # правки чужих аккаунтов молча игнорируем: черновики видит только владелец
+        log.warning("web_app_data от постороннего пользователя %s — пропущено", msg.from_user.id)
+        return
+
+    parsed = _parse_editor_payload(msg.web_app_data.data)
+    if parsed is None:
+        await msg.answer("Не удалось обработать данные редактора", reply_markup=ReplyKeyboardRemove())
+        return
+    draft_id, text = parsed
+
+    if not db.update_draft_text(conn, draft_id, text):
+        await msg.answer("Черновик уже неактуален", reply_markup=ReplyKeyboardRemove())
+        return
+
+    draft = db.get_draft(conn, draft_id)
+    if draft["card_message_id"] is not None:
+        try:
+            await bot.edit_message_text(
+                chat_id=connection["owner_id"],
+                message_id=draft["card_message_id"],
+                text=_card_text(draft, _contact_name(conn, draft["chat_id"])),
+                reply_markup=_card_markup(draft_id, settings),
+            )
+        except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
+            log.warning("не удалось отредактировать карточку черновика %s: %s", draft_id, exc)
+    await msg.answer("✏️ Черновик обновлён", reply_markup=ReplyKeyboardRemove())

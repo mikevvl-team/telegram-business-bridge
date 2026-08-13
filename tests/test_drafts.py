@@ -1,9 +1,17 @@
+import json
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
+from aiogram.types import ReplyKeyboardRemove
 
 from tg_business_bridge import db
-from tg_business_bridge.daemon.draft_handlers import on_draft_callback, process_new_drafts
+from tg_business_bridge.daemon.draft_handlers import (
+    _card_markup,
+    on_draft_callback,
+    on_editor_result,
+    process_new_drafts,
+)
 from test_db import _msg
 from test_business_handlers import settings  # noqa: F401 - фикстура
 
@@ -13,6 +21,13 @@ def ready_conn(conn):
     db.upsert_connection(conn, "c1", 42, '{"can_reply": true}', True)
     db.insert_message(conn, _msg(message_id=10, direction="in"))
     return conn
+
+
+def _webapp_msg(user_id: int, data: str):
+    msg = AsyncMock()
+    msg.from_user.id = user_id
+    msg.web_app_data.data = data
+    return msg
 
 
 @pytest.mark.asyncio
@@ -29,7 +44,7 @@ async def test_pending_draft_sends_card(ready_conn, settings):  # noqa: F811
     assert "черновик ответа" in call.kwargs["text"]
     kb = call.kwargs["reply_markup"].inline_keyboard[0]
     assert kb[0].callback_data == f"draft:{did}:approve"
-    assert kb[1].callback_data == f"draft:{did}:reject"
+    assert kb[1].callback_data == f"draft:{did}:edit"
 
 
 @pytest.mark.asyncio
@@ -122,8 +137,8 @@ async def test_callback_approve_and_reject(ready_conn, settings):  # noqa: F811
         cb.data = data
         return cb
 
-    await on_draft_callback(_cb(f"draft:{d1}:approve"), conn=ready_conn, bot=bot)
-    await on_draft_callback(_cb(f"draft:{d2}:reject"), conn=ready_conn, bot=bot)
+    await on_draft_callback(_cb(f"draft:{d1}:approve"), conn=ready_conn, bot=bot, settings=settings)
+    await on_draft_callback(_cb(f"draft:{d2}:reject"), conn=ready_conn, bot=bot, settings=settings)
     assert db.get_draft(ready_conn, d1)["status"] == "approved"
     assert db.get_draft(ready_conn, d2)["status"] == "rejected"
 
@@ -138,7 +153,7 @@ async def test_reject_callback_edits_card(ready_conn, settings):  # noqa: F811
     cb.message = AsyncMock()
     cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
 
-    await on_draft_callback(cb, conn=ready_conn, bot=bot)
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
     assert db.get_draft(ready_conn, did)["status"] == "rejected"
     edit_call = cb.message.edit_text.await_args
@@ -156,7 +171,7 @@ async def test_approve_callback_edits_card(ready_conn, settings):  # noqa: F811
     cb.message = AsyncMock()
     cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
 
-    await on_draft_callback(cb, conn=ready_conn, bot=bot)
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
     assert db.get_draft(ready_conn, did)["status"] == "approved"
     edit_call = cb.message.edit_text.await_args
@@ -217,7 +232,7 @@ async def test_approve_guard_rejects_when_status_changed_before_write(
     cb.message = AsyncMock()
     cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
 
-    await on_draft_callback(cb, conn=ready_conn, bot=bot)
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
     row = ready_conn.execute("SELECT status FROM drafts WHERE id=?", (did,)).fetchone()
     assert row["status"] == "superseded"
@@ -295,11 +310,11 @@ async def test_malformed_callback_data_ignored(ready_conn, settings):  # noqa: F
         return cb
 
     # Test non-digit draft_id
-    await on_draft_callback(_cb("draft:abc:approve"), conn=ready_conn, bot=bot)
+    await on_draft_callback(_cb("draft:abc:approve"), conn=ready_conn, bot=bot, settings=settings)
     assert db.get_draft(ready_conn, d1)["status"] == "awaiting"
 
     # Test invalid action
-    await on_draft_callback(_cb(f"draft:{d2}:destroy"), conn=ready_conn, bot=bot)
+    await on_draft_callback(_cb(f"draft:{d2}:destroy"), conn=ready_conn, bot=bot, settings=settings)
     assert db.get_draft(ready_conn, d2)["status"] == "awaiting"
 
 
@@ -462,8 +477,174 @@ async def test_callback_on_superseded_draft_leaves_status(ready_conn, settings):
     cb = AsyncMock()
     cb.data = f"draft:{did}:approve"
 
-    await on_draft_callback(cb, conn=ready_conn, bot=bot)
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
     assert db.get_draft(ready_conn, did)["status"] == "superseded"
     cb.answer.assert_awaited_once_with("Черновик уже неактуален")
     cb.message.edit_text.assert_not_awaited()
+
+
+def test_update_draft_text_only_on_awaiting(ready_conn):
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+
+    assert db.update_draft_text(ready_conn, did, "новый") is True
+    assert db.get_draft(ready_conn, did)["text"] == "новый"
+
+    for status in ("pending", "approved", "sending", "sent", "rejected", "superseded"):
+        other = db.create_draft(ready_conn, 777, "исходный", status)
+        assert db.update_draft_text(ready_conn, other, "правка") is False
+        assert db.get_draft(ready_conn, other)["text"] == "исходный"
+
+
+def test_card_markup_without_editor_url_has_no_edit_button(settings):  # noqa: F811
+    settings.editor_url = ""
+    kb = _card_markup(7, settings).inline_keyboard[0]
+    assert [b.callback_data for b in kb] == ["draft:7:approve"]
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_offers_editor_button(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "текст с пробелами", "awaiting")
+    bot = AsyncMock()
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+    cb.message.chat.id = 42
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["status"] == "awaiting"  # редактирование не меняет статус
+    call = bot.send_message.await_args
+    assert call.kwargs["chat_id"] == 42
+    button = call.kwargs["reply_markup"].keyboard[0][0]
+    assert button.web_app.url == (
+        f"{settings.editor_url}#id={did}&text={quote('текст с пробелами')}"
+    )
+    cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_without_editor_url_answers(ready_conn, settings):  # noqa: F811
+    # карточка с кнопкой могла быть разослана до того, как редактор выключили
+    did = db.create_draft(ready_conn, 777, "черновик", "awaiting")
+    settings.editor_url = ""
+    bot = AsyncMock()
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    bot.send_message.assert_not_called()
+    cb.answer.assert_awaited_once_with("Редактор недоступен")
+    assert db.get_draft(ready_conn, did)["status"] == "awaiting"
+    assert db.get_draft(ready_conn, did)["text"] == "черновик"
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_send_failure_answers_callback(ready_conn, settings):  # noqa: F811
+    # без ответа на callback пользователь видел бы вечный спиннер
+    did = db.create_draft(ready_conn, 777, "черновик", "awaiting")
+    bot = AsyncMock()
+    bot.send_message.side_effect = RuntimeError("BUTTON_URL_INVALID")
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    assert "Не удалось открыть редактор" in cb.answer.await_args.args[0]
+    cb.answer.assert_awaited_once()
+    assert db.get_draft(ready_conn, did)["status"] == "awaiting"
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_on_stale_draft_does_nothing(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "уже отправлен", "sent")
+    bot = AsyncMock()
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    cb.answer.assert_awaited_once_with("Черновик уже обработан")
+    bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_editor_result_updates_draft_and_card(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    db.set_draft_card(ready_conn, did, 111)
+    bot = AsyncMock()
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["text"] == "исправленный"
+    edit_call = bot.edit_message_text.await_args
+    assert edit_call.kwargs["chat_id"] == 42
+    assert edit_call.kwargs["message_id"] == 111
+    assert "исправленный" in edit_call.kwargs["text"]
+    kb = edit_call.kwargs["reply_markup"].inline_keyboard[0]
+    assert [b.callback_data for b in kb] == [f"draft:{did}:approve", f"draft:{did}:edit"]
+    answer = msg.answer.await_args
+    assert "обновлён" in answer.args[0]
+    assert isinstance(answer.kwargs["reply_markup"], ReplyKeyboardRemove)
+
+
+@pytest.mark.asyncio
+async def test_editor_result_without_card_skips_edit(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    bot = AsyncMock()
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["text"] == "исправленный"
+    bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_editor_result_from_stranger_ignored(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    bot = AsyncMock()
+    msg = _webapp_msg(999, json.dumps({"id": str(did), "text": "чужая правка"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["text"] == "старый"
+    msg.answer.assert_not_awaited()
+    bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_editor_result_garbage_leaves_draft(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    bot = AsyncMock()
+    payloads = [
+        "не json",
+        json.dumps({"id": str(did)}),                      # нет текста
+        json.dumps({"text": "правка"}),                    # нет id
+        json.dumps({"id": "abc", "text": "правка"}),       # id не число
+        json.dumps({"id": str(did), "text": "   "}),       # пустой текст
+        json.dumps({"id": str(did), "text": 5}),           # текст не строка
+        json.dumps({"id": str(did), "text": "x" * 4097}),  # длиннее лимита Telegram
+        json.dumps(["id", "text"]),                        # не объект
+    ]
+    for payload in payloads:
+        msg = _webapp_msg(42, payload)
+        await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+        assert msg.answer.await_args.args[0] == "Не удалось обработать данные редактора"
+
+    assert db.get_draft(ready_conn, did)["text"] == "старый"
+
+
+@pytest.mark.asyncio
+async def test_editor_result_on_non_awaiting_draft_rejected(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "approved")
+    bot = AsyncMock()
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "поздняя правка"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["text"] == "старый"
+    answer = msg.answer.await_args
+    assert answer.args[0] == "Черновик уже неактуален"
+    assert isinstance(answer.kwargs["reply_markup"], ReplyKeyboardRemove)

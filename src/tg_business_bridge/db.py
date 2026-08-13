@@ -237,6 +237,16 @@ def set_draft_status_if(
     return cur.rowcount == 1
 
 
+def update_draft_text(conn: sqlite3.Connection, draft_id: int, text: str) -> bool:
+    """Заменяет текст черновика, пока тот ждёт решения владельца. False, если статус уже
+    не 'awaiting': правка не должна догонять отправленный или заменённый черновик."""
+    cur = conn.execute(
+        "UPDATE drafts SET text=? WHERE id=? AND status='awaiting'", (text, draft_id)
+    )
+    conn.commit()
+    return cur.rowcount == 1
+
+
 def set_draft_card(conn: sqlite3.Connection, draft_id: int, message_id: int) -> None:
     conn.execute("UPDATE drafts SET card_message_id=? WHERE id=?", (message_id, draft_id))
     conn.commit()
