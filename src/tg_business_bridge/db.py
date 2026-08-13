@@ -60,7 +60,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     status TEXT NOT NULL,
     error TEXT,
     created_ts INTEGER NOT NULL,
-    card_message_id INTEGER
+    card_message_id INTEGER,
+    edit_prompt_message_id INTEGER
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text, content='messages', content_rowid='id', tokenize='unicode61'
@@ -104,6 +105,16 @@ def _secure_db_files(db_path: Path) -> None:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # БД, созданные до появления редактора черновиков, колонки не имеют — CREATE TABLE
+    # IF NOT EXISTS их не обновит (r[1] — имя колонки в PRAGMA table_info)
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(drafts)")}
+    if "edit_prompt_message_id" not in cols:
+        try:
+            conn.execute("ALTER TABLE drafts ADD COLUMN edit_prompt_message_id INTEGER")
+        except sqlite3.OperationalError as e:
+            # демон и MCP-сервер стартуют независимо: колонку мог добавить сосед
+            if "duplicate column name" not in str(e):
+                raise
     conn.commit()
 
 
@@ -249,6 +260,13 @@ def update_draft_text(conn: sqlite3.Connection, draft_id: int, text: str) -> boo
 
 def set_draft_card(conn: sqlite3.Connection, draft_id: int, message_id: int) -> None:
     conn.execute("UPDATE drafts SET card_message_id=? WHERE id=?", (message_id, draft_id))
+    conn.commit()
+
+
+def set_edit_prompt(conn: sqlite3.Connection, draft_id: int, message_id: int | None) -> None:
+    """Запоминает (или забывает, при None) сообщение-приглашение открыть редактор —
+    чтобы удалить его, когда оно перестанет быть нужным."""
+    conn.execute("UPDATE drafts SET edit_prompt_message_id=? WHERE id=?", (message_id, draft_id))
     conn.commit()
 
 

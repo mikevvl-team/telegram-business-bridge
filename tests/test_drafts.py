@@ -1,4 +1,5 @@
 import json
+import sqlite3
 from unittest.mock import AsyncMock
 from urllib.parse import quote
 
@@ -506,13 +507,16 @@ def test_card_markup_without_editor_url_has_no_edit_button(settings):  # noqa: F
 async def test_edit_callback_offers_editor_button(ready_conn, settings):  # noqa: F811
     did = db.create_draft(ready_conn, 777, "текст с пробелами", "awaiting")
     bot = AsyncMock()
+    bot.send_message.return_value.message_id = 501
     cb = AsyncMock()
     cb.data = f"draft:{did}:edit"
     cb.message.chat.id = 42
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
-    assert db.get_draft(ready_conn, did)["status"] == "awaiting"  # редактирование не меняет статус
+    row = db.get_draft(ready_conn, did)
+    assert row["status"] == "awaiting"  # редактирование не меняет статус
+    assert row["edit_prompt_message_id"] == 501
     call = bot.send_message.await_args
     assert call.kwargs["chat_id"] == 42
     button = call.kwargs["reply_markup"].keyboard[0][0]
@@ -520,6 +524,23 @@ async def test_edit_callback_offers_editor_button(ready_conn, settings):  # noqa
         f"{settings.editor_url}#id={did}&text={quote('текст с пробелами')}"
     )
     cb.answer.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_replaces_previous_prompt(ready_conn, settings):  # noqa: F811
+    # повторное «Редактировать» не должно копить приглашения в диалоге
+    did = db.create_draft(ready_conn, 777, "черновик", "awaiting")
+    db.set_edit_prompt(ready_conn, did, 500)
+    bot = AsyncMock()
+    bot.send_message.return_value.message_id = 600
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+    cb.message.chat.id = 42
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    assert bot.delete_message.await_args.kwargs["message_id"] == 500
+    assert db.get_draft(ready_conn, did)["edit_prompt_message_id"] == 600
 
 
 @pytest.mark.asyncio
@@ -568,37 +589,181 @@ async def test_edit_callback_on_stale_draft_does_nothing(ready_conn, settings): 
     bot.send_message.assert_not_called()
 
 
+def _sending_bot(*message_ids: int):
+    """Бот, чьи send_message отдают заданные message_id по порядку вызовов."""
+    bot = AsyncMock()
+    ids = iter(message_ids)
+
+    async def send(*args, **kwargs):
+        sent = AsyncMock()
+        sent.message_id = next(ids)
+        return sent
+
+    bot.send_message.side_effect = send
+    return bot
+
+
 @pytest.mark.asyncio
-async def test_editor_result_updates_draft_and_card(ready_conn, settings):  # noqa: F811
+async def test_editor_result_reposts_card_and_cleans_up(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    db.set_draft_card(ready_conn, did, 111)
+    db.set_edit_prompt(ready_conn, did, 222)
+    bot = _sending_bot(901, 902)  # 901 — сообщение-«ножницы», 902 — новая карточка
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    row = db.get_draft(ready_conn, did)
+    assert row["text"] == "исправленный"
+    assert row["status"] == "awaiting"  # статус не трогаем
+    assert row["edit_prompt_message_id"] is None
+    assert row["card_message_id"] == 902  # карточка пересоздана внизу диалога
+
+    msg.delete.assert_awaited_once()  # плашка «данные переданы боту»
+    deleted = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+    assert deleted == [222, 901, 111]  # приглашение, «ножницы», старая карточка
+
+    stub, card = bot.send_message.await_args_list
+    assert stub.kwargs["text"] == "✂️"
+    assert isinstance(stub.kwargs["reply_markup"], ReplyKeyboardRemove)
+    assert card.kwargs["chat_id"] == 42
+    assert "исправленный" in card.kwargs["text"]
+    kb = card.kwargs["reply_markup"].inline_keyboard[0]
+    assert [b.callback_data for b in kb] == [f"draft:{did}:approve", f"draft:{did}:edit"]
+    msg.answer.assert_not_awaited()  # подтверждение — сама свежая карточка
+
+
+@pytest.mark.asyncio
+async def test_editor_result_without_prompt_id_still_drops_keyboard(ready_conn, settings):  # noqa: F811
+    # id приглашения мог не сохраниться (черновик застал обновление в процессе правки),
+    # но клавиатура на экране точно есть — раз пришли данные редактора
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    bot = _sending_bot(901, 902)
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    stub, card = bot.send_message.await_args_list
+    assert stub.kwargs["text"] == "✂️"
+    assert isinstance(stub.kwargs["reply_markup"], ReplyKeyboardRemove)
+    deleted = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+    assert deleted == [901]  # «ножницы» отправлены и убраны, больше удалять нечего
+    assert card.kwargs["chat_id"] == 42
+    assert db.get_draft(ready_conn, did)["card_message_id"] == 902
+    bot.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_editor_result_undeletable_card_is_marked_replaced(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    db.set_draft_card(ready_conn, did, 111)
+    bot = _sending_bot(901, 902)
+
+    async def delete(chat_id, message_id):
+        if message_id == 111:  # Telegram не даёт удалять сообщения старше 48 часов
+            raise RuntimeError("message can't be deleted")
+
+    bot.delete_message.side_effect = delete
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    edit_call = bot.edit_message_text.await_args
+    assert edit_call.kwargs["message_id"] == 111
+    assert edit_call.kwargs["text"].endswith("⏭ Заменён обновлённой карточкой")
+    assert edit_call.kwargs["reply_markup"] is None
+    assert db.get_draft(ready_conn, did)["card_message_id"] == 902  # новая карточка всё равно ушла
+
+
+@pytest.mark.asyncio
+async def test_editor_result_card_send_failure_keeps_old_card(ready_conn, settings):  # noqa: F811
+    # если новая карточка не ушла, старая должна остаться рабочей — иначе черновик
+    # остался бы в awaiting вообще без кнопок
     did = db.create_draft(ready_conn, 777, "старый", "awaiting")
     db.set_draft_card(ready_conn, did, 111)
     bot = AsyncMock()
+    sends = {"n": 0}
+
+    async def send(*args, **kwargs):
+        sends["n"] += 1
+        if sends["n"] == 1:  # «ножницы» уходят, падает уже карточка
+            stub = AsyncMock()
+            stub.message_id = 901
+            return stub
+        raise RuntimeError("bot was blocked by the user")
+
+    bot.send_message.side_effect = send
     msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
 
-    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+    with pytest.raises(RuntimeError):
+        await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
-    assert db.get_draft(ready_conn, did)["text"] == "исправленный"
-    edit_call = bot.edit_message_text.await_args
-    assert edit_call.kwargs["chat_id"] == 42
-    assert edit_call.kwargs["message_id"] == 111
-    assert "исправленный" in edit_call.kwargs["text"]
-    kb = edit_call.kwargs["reply_markup"].inline_keyboard[0]
-    assert [b.callback_data for b in kb] == [f"draft:{did}:approve", f"draft:{did}:edit"]
-    answer = msg.answer.await_args
-    assert "обновлён" in answer.args[0]
-    assert isinstance(answer.kwargs["reply_markup"], ReplyKeyboardRemove)
+    row = db.get_draft(ready_conn, did)
+    assert row["text"] == "исправленный"  # правка сохранена
+    assert row["card_message_id"] == 111  # карточка в БД прежняя
+    deleted = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+    assert deleted == [901]  # удалены только «ножницы», старая карточка на месте
 
 
 @pytest.mark.asyncio
-async def test_editor_result_without_card_skips_edit(ready_conn, settings):  # noqa: F811
-    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
-    bot = AsyncMock()
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+async def test_approve_callback_cleans_up_editor_prompt(ready_conn, settings):  # noqa: F811
+    # владелец открыл редактор, но передумал и отправил черновик прямо с карточки —
+    # приглашение с клавиатурой не должно остаться висеть в чате
+    did = db.create_draft(ready_conn, 777, "b", "awaiting")
+    db.set_draft_card(ready_conn, did, 111)
+    db.set_edit_prompt(ready_conn, did, 222)
+    bot = _sending_bot(901)  # «ножницы»
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:approve"
+    cb.message.chat.id = 42
+    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
 
-    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
-    assert db.get_draft(ready_conn, did)["text"] == "исправленный"
-    bot.edit_message_text.assert_not_awaited()
+    row = db.get_draft(ready_conn, did)
+    assert row["status"] == "approved"
+    assert row["edit_prompt_message_id"] is None
+    deleted = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+    assert deleted == [222, 901]  # приглашение и следом «ножницы»
+
+
+@pytest.mark.asyncio
+async def test_reject_callback_cleans_up_editor_prompt(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "b", "awaiting")
+    db.set_edit_prompt(ready_conn, did, 222)
+    bot = _sending_bot(901)
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:reject"
+    cb.message.chat.id = 42
+    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["edit_prompt_message_id"] is None
+    deleted = [c.kwargs["message_id"] for c in bot.delete_message.await_args_list]
+    assert deleted == [222, 901]
+
+
+@pytest.mark.asyncio
+async def test_stale_draft_callback_leaves_editor_prompt(ready_conn, settings, monkeypatch):  # noqa: F811
+    # флип не удался — черновик уже неактуален, ничего дополнительно не убираем
+    did = db.create_draft(ready_conn, 777, "b", "awaiting")
+    db.set_edit_prompt(ready_conn, did, 222)
+    stale_snapshot = dict(db.get_draft(ready_conn, did))
+    monkeypatch.setattr(db, "get_draft", lambda conn, draft_id: stale_snapshot)
+    ready_conn.execute("UPDATE drafts SET status='superseded' WHERE id=?", (did,))
+    ready_conn.commit()
+    bot = _sending_bot(901)
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:reject"
+    cb.message.chat.id = 42
+    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    bot.delete_message.assert_not_awaited()
+    row = ready_conn.execute("SELECT * FROM drafts WHERE id=?", (did,)).fetchone()
+    assert row["edit_prompt_message_id"] == 222
 
 
 @pytest.mark.asyncio
@@ -611,7 +776,8 @@ async def test_editor_result_from_stranger_ignored(ready_conn, settings):  # noq
 
     assert db.get_draft(ready_conn, did)["text"] == "старый"
     msg.answer.assert_not_awaited()
-    bot.edit_message_text.assert_not_awaited()
+    msg.delete.assert_not_awaited()  # чужие сообщения не трогаем
+    bot.send_message.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -632,6 +798,7 @@ async def test_editor_result_garbage_leaves_draft(ready_conn, settings):  # noqa
         msg = _webapp_msg(42, payload)
         await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
         assert msg.answer.await_args.args[0] == "Не удалось обработать данные редактора"
+        msg.delete.assert_awaited_once()  # плашка убирается при любом исходе
 
     assert db.get_draft(ready_conn, did)["text"] == "старый"
 
@@ -648,3 +815,82 @@ async def test_editor_result_on_non_awaiting_draft_rejected(ready_conn, settings
     answer = msg.answer.await_args
     assert answer.args[0] == "Черновик уже неактуален"
     assert isinstance(answer.kwargs["reply_markup"], ReplyKeyboardRemove)
+    msg.delete.assert_awaited_once()
+    bot.send_message.assert_not_called()  # карточку не пересоздаём
+
+
+_OLD_DRAFTS_SCHEMA = """CREATE TABLE drafts (
+    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, text TEXT NOT NULL,
+    status TEXT NOT NULL, error TEXT, created_ts INTEGER NOT NULL,
+    card_message_id INTEGER)"""
+
+
+def test_init_schema_adds_edit_prompt_column(tmp_path):
+    raw = sqlite3.connect(tmp_path / "old.db")
+    raw.execute(_OLD_DRAFTS_SCHEMA)
+    raw.commit()
+
+    db.init_schema(raw)
+    db.init_schema(raw)  # повторный старт демона не должен падать
+
+    cols = {r[1] for r in raw.execute("PRAGMA table_info(drafts)")}
+    assert "edit_prompt_message_id" in cols
+    raw.close()
+
+
+class _ProxyConnection:
+    """Вклинивается в шаги миграции: у sqlite3.Connection атрибуты read-only,
+    подменить execute на самом соединении нельзя."""
+
+    def __init__(self, conn, after_pragma=None, alter_error=None):
+        self._conn = conn
+        self._after_pragma = after_pragma
+        self._alter_error = alter_error
+
+    def executescript(self, sql):
+        return self._conn.executescript(sql)
+
+    def execute(self, sql, *args):
+        if self._alter_error is not None and sql.startswith("ALTER TABLE"):
+            raise self._alter_error
+        cur = self._conn.execute(sql, *args)
+        if self._after_pragma is not None and sql.startswith("PRAGMA table_info"):
+            rows = cur.fetchall()
+            self._after_pragma()
+            return rows
+        return cur
+
+    def commit(self):
+        return self._conn.commit()
+
+
+def test_init_schema_survives_concurrent_migration(tmp_path):
+    # демон и MCP-сервер стартуют независимо: колонку мог добавить сосед
+    # между нашими PRAGMA и ALTER
+    path = tmp_path / "race.db"
+    primary = sqlite3.connect(path)
+    rival = sqlite3.connect(path)
+    primary.execute(_OLD_DRAFTS_SCHEMA)
+    primary.commit()
+
+    def rival_migrates():
+        rival.execute("ALTER TABLE drafts ADD COLUMN edit_prompt_message_id INTEGER")
+        rival.commit()
+
+    db.init_schema(_ProxyConnection(primary, after_pragma=rival_migrates))
+
+    cols = {r[1] for r in primary.execute("PRAGMA table_info(drafts)")}
+    assert "edit_prompt_message_id" in cols
+    primary.close()
+    rival.close()
+
+
+def test_init_schema_reraises_other_operational_errors(tmp_path):
+    raw = sqlite3.connect(tmp_path / "broken.db")
+    raw.execute(_OLD_DRAFTS_SCHEMA)
+    raw.commit()
+    locked = sqlite3.OperationalError("database is locked")
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        db.init_schema(_ProxyConnection(raw, alter_error=locked))
+    raw.close()
