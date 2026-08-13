@@ -25,7 +25,9 @@ switchable off in Settings at any moment. There is simply nothing to ban you for
 
 **"I'm afraid to let an AI send messages as me."**
 Reasonable. By default the agent can only *draft* a reply. You get a card in Telegram
-with the text and two buttons — ✅ Send / ❌ Reject. Nothing leaves without your tap.
+with the text and two buttons — ✅ Send / ✏️ Edit. Nothing leaves without your tap,
+and if the wording is almost-but-not-quite right, you fix it in an editor window
+right inside Telegram instead of retyping the whole reply.
 Auto-send is strictly opt-in: enable it per chat (`BRIDGE_AUTO_SEND_CHAT_IDS`) for
 the conversations you genuinely trust the agent with, or globally
 (`BRIDGE_SEND_POLICY=auto`) once you are sure.
@@ -77,9 +79,12 @@ Telegram Business API
 
 - 7 MCP tools: `list_chats`, `get_history`, `search_messages`, `get_context`,
   `draft_reply`, `send_reply`, `list_drafts`.
-- Draft approval cards (✅/❌) with live status (⏳ Sending… → ✅ Sent / ⚠️ Failed /
-  ❌ Rejected); when a new draft arrives for the same chat, the older card is marked
+- Draft approval cards (✅ Send / ✏️ Edit) with live status (⏳ Sending… → ✅ Sent /
+  ⚠️ Failed); when a new draft arrives for the same chat, the older card is marked
   "⏭ Superseded by a newer draft".
+- Draft editing in a Telegram Mini App: ✏️ opens an editor window with the draft
+  text, you fix it, the card updates in place — then ✅ Send as usual
+  (see [Editing drafts](#editing-drafts-mini-app)).
 - Voice / audio / video-note transcription via Deepgram (optional, needs an API key).
 - Optional auto-deletion of media *files* older than N days (texts and file_id are kept forever).
 - Prompt-injection boundary: all message content reaches the agent wrapped in
@@ -179,6 +184,43 @@ people are, what was agreed — into its own knowledge base, for example
 [lorebase](https://github.com/AndyShaman/lorebase), an LLM-wiki skill. How to
 build that memory on top of this bridge is described in [AGENTS.md](AGENTS.md).
 
+## Editing drafts (Mini App)
+
+Pressing ✏️ Edit on a draft card sends you a keyboard button that opens a
+[Telegram Mini App](https://core.telegram.org/bots/webapps) — a plain editor
+window with the draft text. Fix the text, tap 💾 Save: the card re-renders with
+the new text and the same buttons, then ✅ Send when you are happy. You can edit
+as many times as you like; the draft stays yours until you send it.
+
+How it works under the hood — and why it is private:
+
+- The editor page (`docs/editor.html`) is a **static, self-contained HTML file**:
+  no backend, no analytics, no storage, no external requests except Telegram's
+  official `telegram-web-app.js`.
+- The draft text travels to the page in the **URL fragment** (`#...`), which
+  browsers never send to the hosting server — the host only ever sees a request
+  for the empty page shell. The edited text returns to the bot through Telegram's
+  own `sendData` channel. Your correspondence never touches the page host.
+- The bot accepts editor results **only from the owner** and only while the
+  draft is still `awaiting`.
+
+By default `BRIDGE_EDITOR_URL` points to the page served from this repository's
+GitHub Pages. If you run your own fork, host your own copy — trusting someone
+else's page means trusting their JavaScript with your draft texts:
+
+1. Fork the repo, enable **Settings → Pages → Deploy from a branch → `main` /
+   `docs`** (the page is already in `docs/editor.html`) — or put that single
+   file on any static HTTPS hosting.
+2. Set `BRIDGE_EDITOR_URL=https://<you>.github.io/<repo>/editor.html` in `.env`
+   and restart the daemon.
+
+Set `BRIDGE_EDITOR_URL=` (empty) to disable editing — cards then show only
+✅ Send. Limits: Telegram caps the editor's return channel at 4096 bytes of
+JSON (roughly 2000 Cyrillic or 4000 Latin characters); the editor shows a live
+byte counter and refuses to save anything over the limit. On extremely long
+drafts the editor button may fail to open (button URL length) — the bot answers
+with an explicit error instead of hanging.
+
 ## Configuration (env)
 
 | Variable | Description |
@@ -192,6 +234,7 @@ build that memory on top of this bridge is described in [AGENTS.md](AGENTS.md).
 | BRIDGE_MCP_PORT | MCP server port for streamable-http (default 8765) |
 | BRIDGE_DEEPGRAM_API_KEY | Deepgram key: voice, audio and video notes (voice/audio/video_note) → text (optional; empty default = no transcription) |
 | BRIDGE_MEDIA_RETENTION_DAYS | 0 = keep forever (default); media files older than N days are deleted from disk, texts and file_id are kept |
+| BRIDGE_EDITOR_URL | HTTPS URL of the Mini App draft editor page (default: this repo's GitHub Pages copy of `docs/editor.html`; empty = editing disabled, forks should host their own — see [Editing drafts](#editing-drafts-mini-app)) |
 
 Changing any of these requires restarting the affected process (daemon and/or MCP server).
 

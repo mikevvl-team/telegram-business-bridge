@@ -64,7 +64,11 @@ Typical cycle: `list_chats` → `get_history`/`search_messages` → `get_context
 - `list_drafts(chat_id=None, limit=20)` — check a draft's fate. Statuses:
   pending (just created) → awaiting (card sent to the owner) →
   approved/sending (confirmed, being sent) → sent/failed. Also: rejected
-  (the owner declined), superseded (replaced by a newer draft in the same chat).
+  (the owner declined — legacy: new cards have no Reject button, an unwanted
+  draft simply stays in awaiting until superseded), superseded (replaced by a
+  newer draft in the same chat). While a draft is awaiting, the owner can edit
+  its text right on the card (✏️) — the text in list_drafts will change;
+  that is expected.
 - `send_reply(chat_id, text)` — direct send without the owner's confirmation.
   Works only for chats with auto-send enabled; otherwise use `draft_reply`.
 
@@ -88,6 +92,11 @@ Typical cycle: `list_chats` → `get_history`/`search_messages` → `get_context
    tell the user a reply will be possible after the next incoming message.
 7. Reply on the owner's behalf in their style and in the language of the
    conversation. In doubt — ask the owner instead of sending.
+8. The owner can edit your draft before sending it (the ✏️ button on the card).
+   The text actually sent is the outgoing message in the chat history, not your
+   `draft_reply` call — when saving takeaways, rely on the history. The owner's
+   edits are free style feedback: compare them with your wording and take them
+   into account in future drafts.
 
 ## Proactive recipe (optional)
 
