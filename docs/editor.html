@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Редактор черновика</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  /* Только цвета темы Telegram — страница не делает ни одного внешнего запроса,
+     текст черновика живёт в URL-фрагменте и не покидает устройство */
+  * { box-sizing: border-box; margin: 0; }
+  html, body { height: 100%; }
+  body {
+    display: flex;
+    flex-direction: column;
+    font: 16px/1.45 -apple-system, system-ui, sans-serif;
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #000);
+    padding: 12px;
+    gap: 8px;
+  }
+  textarea {
+    flex: 1;
+    width: 100%;
+    resize: none;
+    border: 1px solid var(--tg-theme-hint-color, #999);
+    border-radius: 10px;
+    padding: 10px;
+    font: inherit;
+    background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+    color: inherit;
+    outline: none;
+  }
+  #counter {
+    font-size: 13px;
+    color: var(--tg-theme-hint-color, #708499);
+    text-align: right;
+    min-height: 18px;
+  }
+  #counter.over { color: #e53935; font-weight: 600; }
+</style>
+</head>
+<body>
+<textarea id="text" autofocus></textarea>
+<div id="counter"></div>
+<script>
+(function () {
+  var tg = window.Telegram.WebApp;
+  tg.ready();
+  tg.expand();
+
+  var params = new URLSearchParams(location.hash.slice(1));
+  var draftId = params.get("id") || "";
+  var area = document.getElementById("text");
+  var counter = document.getElementById("counter");
+  area.value = params.get("text") || "";
+
+  // Лимит Telegram на sendData — 4096 байт на весь JSON-конверт
+  var LIMIT = 4096;
+  var enc = new TextEncoder();
+
+  function payload() {
+    return JSON.stringify({ id: draftId, text: area.value });
+  }
+
+  function refresh() {
+    var used = enc.encode(payload()).length;
+    var empty = area.value.trim().length === 0;
+    if (used > LIMIT) {
+      counter.textContent = "Слишком длинно: " + used + " из " + LIMIT + " байт — сократи текст";
+      counter.className = "over";
+    } else {
+      counter.textContent = used + " / " + LIMIT + " байт";
+      counter.className = "";
+    }
+    if (empty || used > LIMIT) {
+      tg.MainButton.disable();
+      tg.MainButton.setParams({ color: "#9e9e9e" });
+    } else {
+      tg.MainButton.enable();
+      tg.MainButton.setParams({ color: tg.themeParams.button_color || "#2481cc" });
+    }
+  }
+
+  tg.MainButton.setText("💾 Сохранить");
+  tg.MainButton.show();
+  tg.MainButton.onClick(function () {
+    var data = payload();
+    if (enc.encode(data).length > LIMIT || area.value.trim().length === 0) return;
+    tg.sendData(data); // отправляет боту и закрывает окно
+  });
+
+  area.addEventListener("input", refresh);
+  refresh();
+  area.focus();
+})();
+</script>
+</body>
+</html>
