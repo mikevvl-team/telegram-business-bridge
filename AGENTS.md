@@ -59,11 +59,14 @@ Typical cycle: `list_chats` → `get_history`/`search_messages` → `get_context
 - `get_context(chat_id, message_id, radius=5)` — the context around a found
   message. `search_messages` gives you the needle, `get_context` the haystack:
   neighboring messages before and after, to understand the thread.
-- `draft_reply(chat_id, text)` — propose a reply on the owner's behalf. The
-  primary way to answer.
-  Text is sent as plain text by default; to hide a link under a word, use
-  Telegram HTML: `<a href="URL">word</a>` — then escape `&`, `<`, `>` in the
-  rest of the text as `&amp;`, `&lt;`, `&gt;`.
+- `draft_reply(chat_id, text, html=False)` — propose a reply on the owner's
+  behalf. The primary way to answer. With `html=True` the text is Telegram
+  HTML: `<b>`, `<i>`, `<u>`, `<s>`, `<code>`, `<pre>`, `<a href="…">`. In such
+  text you must escape `&lt;`, `&gt;`, `&amp;` yourself — everything else is
+  treated as markup. Links inside the text go only this way:
+  `<a href="https://…">what it is about</a>`, never as a bare URL on its own
+  line. Invalid markup moves the draft to `failed` with Telegram's error text —
+  check `list_drafts`.
 - `list_drafts(chat_id=None, limit=20)` — check a draft's fate. Statuses:
   pending (just created) → awaiting (card sent to the owner) →
   approved/sending (confirmed, being sent) → sent/failed. Also: rejected
@@ -71,9 +74,11 @@ Typical cycle: `list_chats` → `get_history`/`search_messages` → `get_context
   draft simply stays in awaiting until superseded), superseded (replaced by a
   newer draft in the same chat). While a draft is awaiting, the owner can edit
   its text right on the card (✏️) — the text in list_drafts will change;
-  that is expected.
-- `send_reply(chat_id, text)` — direct send without the owner's confirmation.
-  Works only for chats with auto-send enabled; otherwise use `draft_reply`.
+  that is expected. After an edit in the Mini App the draft is always HTML —
+  list_drafts marks it `[html]`.
+- `send_reply(chat_id, text, html=False)` — direct send without the owner's
+  confirmation. Works only for chats with auto-send enabled; otherwise use
+  `draft_reply`. The `html` parameter works as in `draft_reply`.
 
 ## Reply rules
 

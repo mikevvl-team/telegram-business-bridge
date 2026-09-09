@@ -1,12 +1,14 @@
 import asyncio
+import html
 import json
 import logging
+import re
 import sqlite3
 import time
 from urllib.parse import quote
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramRetryAfter
+from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -20,6 +22,7 @@ from aiogram.types import (
 
 from tg_business_bridge import db
 from tg_business_bridge.config import Settings
+from tg_business_bridge.formatting import HTML, to_html, visible_text
 from tg_business_bridge.sender import send_business_reply
 
 log = logging.getLogger(__name__)
@@ -39,17 +42,24 @@ _CARD_LIMIT = 3500
 _TRUNCATE_MARKER = "… [обрезано, полный текст будет отправлен]"
 
 
+_CUT_ENTITY_RE = re.compile(r"&[a-z]*$")
+
+
 def _card_text(draft: sqlite3.Row, contact: str) -> str:
+    """Карточка владельцу — всегда Telegram HTML (отправлять её нужно с parse_mode='HTML')."""
     # имя контакта приходит из Telegram и не ограничено схемой БД —
     # без обрезки длинное имя съедает лимит и карточка может превысить 4096
     if len(contact) > 64:
         contact = contact[:63] + "…"
-    header = f"Черновик ответа для {contact} (chat {draft['chat_id']}):\n\n"
-    body = header + draft["text"]
-    if len(body) <= _CARD_LIMIT:
-        return body
+    safe_contact = html.escape(contact, quote=False)
+    header = f"Черновик ответа для {safe_contact} (chat {draft['chat_id']}):\n\n"
+    body = to_html(draft["text"], draft["parse_mode"])
+    if len(header) + len(body) <= _CARD_LIMIT:
+        return header + body
+    # HTML нельзя резать посреди тега: длинная карточка теряет форматирование, но не ломается
     limit = max(0, _CARD_LIMIT - len(header) - len(_TRUNCATE_MARKER))
-    return header + draft["text"][:limit] + _TRUNCATE_MARKER
+    plain = html.escape(visible_text(draft["text"], draft["parse_mode"]), quote=False)[:limit]
+    return header + _CUT_ENTITY_RE.sub("", plain) + _TRUNCATE_MARKER
 
 
 # До этого момента (time.monotonic) карточки не отправляются: Telegram попросил
@@ -68,7 +78,8 @@ async def _send_card(
     contact = _contact_name(conn, draft["chat_id"])
     text = _card_text(draft, contact)
     sent = await bot.send_message(
-        chat_id=connection["owner_id"], text=text, reply_markup=_card_markup(draft["id"], settings)
+        chat_id=connection["owner_id"], text=text, parse_mode=HTML,
+        reply_markup=_card_markup(draft["id"], settings),
     )
     db.set_draft_card(conn, draft["id"], sent.message_id)
     db.set_draft_status(conn, draft["id"], "awaiting")
@@ -82,7 +93,7 @@ async def _send_card(
                 chat_id=connection["owner_id"],
                 message_id=old["card_message_id"],
                 text=old_text + "\n\n⏭ Заменён новым черновиком",
-                reply_markup=None,
+                parse_mode=HTML, reply_markup=None,
             )
         except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
             log.warning("не удалось отредактировать карточку черновика %s: %s", old["id"], exc)
@@ -109,17 +120,26 @@ async def process_new_drafts(bot: Bot, conn: sqlite3.Connection, settings: Setti
                     exc.retry_after, draft["id"],
                 )
                 break
+            except TelegramBadRequest as exc:
+                # чаще всего это битая разметка HTML-черновика: повторы её не исправят,
+                # поэтому черновик закрывается с ошибкой — она видна агенту в list_drafts
+                log.warning("Telegram отклонил карточку черновика %s: %s", draft["id"], exc)
+                db.set_draft_status(
+                    conn, draft["id"], "failed", f"Telegram отклонил карточку: {exc}"
+                )
             except Exception:  # noqa: BLE001 - сбойная карточка не должна блокировать остальные
                 log.exception("не удалось отправить карточку черновика %s", draft["id"])
 
     for draft in db.get_drafts_by_status(conn, "approved"):
         if not db.claim_draft(conn, draft["id"]):
             continue  # уже забрано другим процессом/итерацией
-        if len(draft["text"]) > 4096:
+        if len(visible_text(draft["text"], draft["parse_mode"])) > 4096:
             res = {"ok": False, "error": "текст длиннее 4096 символов — Telegram не примет"}
         else:
             try:
-                res = await send_business_reply(bot, conn, draft["chat_id"], draft["text"])
+                res = await send_business_reply(
+                    bot, conn, draft["chat_id"], draft["text"], draft["parse_mode"]
+                )
             except Exception as exc:  # noqa: BLE001 - черновик не должен зависнуть в 'sending'
                 log.exception("непредвиденная ошибка отправки черновика %s", draft["id"])
                 res = {"ok": False, "error": f"непредвиденная ошибка: {exc}"}
@@ -130,12 +150,17 @@ async def process_new_drafts(bot: Bot, conn: sqlite3.Connection, settings: Setti
 
         if draft["card_message_id"]:
             base_text = _card_text(draft, _contact_name(conn, draft["chat_id"]))
-            suffix = "\n\n✅ Отправлено" if res["ok"] else f"\n\n⚠️ Не удалось отправить: {res['error']}"
+            if res["ok"]:
+                suffix = "\n\n✅ Отправлено"
+            else:
+                # текст ошибки приходит из Telegram и может содержать '<' — карточка идёт как HTML
+                suffix = f"\n\n⚠️ Не удалось отправить: {html.escape(res['error'], quote=False)}"
             try:
                 await bot.edit_message_text(
                     chat_id=connection["owner_id"],
                     message_id=draft["card_message_id"],
                     text=base_text + suffix,
+                    parse_mode=HTML,
                 )
             except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
                 log.warning("не удалось отредактировать карточку черновика %s: %s", draft["id"], exc)
@@ -225,7 +250,8 @@ async def on_draft_callback(
         # sendData умеет только web_app-кнопка reply-клавиатуры, поэтому редактор
         # открывается вторым шагом. Статус не трогаем: черновик остаётся 'awaiting',
         # владелец может передумать и отправить его с карточки как есть.
-        url = f"{settings.editor_url}#id={draft_id}&text={quote(draft['text'])}"
+        editor_html = to_html(draft["text"], draft["parse_mode"])
+        url = f"{settings.editor_url}#id={draft_id}&html={quote(editor_html)}"
         if draft["edit_prompt_message_id"] is not None:
             # повторные нажатия «Редактировать» не должны копить приглашения в диалоге
             try:
@@ -261,14 +287,19 @@ async def on_draft_callback(
         # (WHERE status='awaiting') закрывает TOCTOU с supersede_awaiting: если флип не
         # удался, черновик уже заменён/обработан — возвращаем карточке актуальное состояние.
         try:
-            await cb.message.edit_text(text=cb.message.text + "\n\n⏳ Отправляю…", reply_markup=None)
+            # html_text, а не text: иначе правка карточки теряет entities (ссылки, жирный)
+            await cb.message.edit_text(
+                text=cb.message.html_text + "\n\n⏳ Отправляю…",
+                parse_mode=HTML, reply_markup=None,
+            )
         except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
             log.warning("не удалось отредактировать карточку черновика %s: %s", draft_id, exc)
         if not db.set_draft_status_if(conn, draft_id, "awaiting", "approved"):
             await cb.answer("Черновик уже неактуален")
             try:
                 await cb.message.edit_text(
-                    text=cb.message.text + "\n\n⏭ Черновик уже неактуален", reply_markup=None
+                    text=cb.message.html_text + "\n\n⏭ Черновик уже неактуален",
+                    parse_mode=HTML, reply_markup=None,
                 )
             except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
                 log.warning("не удалось отредактировать карточку черновика %s: %s", draft_id, exc)
@@ -282,26 +313,34 @@ async def on_draft_callback(
             return
         await cb.answer("Отклонено")
         try:
-            await cb.message.edit_text(text=cb.message.text + "\n\n❌ Отклонено", reply_markup=None)
+            await cb.message.edit_text(
+                text=cb.message.html_text + "\n\n❌ Отклонено", parse_mode=HTML, reply_markup=None
+            )
         except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
             log.warning("не удалось отредактировать карточку черновика %s: %s", draft_id, exc)
         await _cleanup_editor_ui(bot, conn, cb.message.chat.id, draft)
 
 
-def _parse_editor_payload(raw: str) -> tuple[int, str] | None:
-    """(draft_id, text) из данных мини-приложения или None, если пришёл мусор.
-    Сам текст никогда не попадает в логи — это личная переписка."""
+def _parse_editor_payload(raw: str) -> tuple[int, str, str | None] | None:
+    """(draft_id, text, parse_mode) из данных мини-приложения или None, если пришёл мусор.
+    Поле html — текущий редактор, text — страница старой версии (её могли разместить
+    самостоятельно). Сам текст никогда не попадает в логи — это личная переписка."""
     try:
         payload = json.loads(raw)
         draft_id_s = str(payload["id"])
-        text = payload["text"]
+        if "html" in payload:
+            text, parse_mode = payload["html"], HTML
+        else:
+            text, parse_mode = payload["text"], None
     except (ValueError, TypeError, KeyError):
         return None
-    if not draft_id_s.isdigit() or not isinstance(text, str) or not text.strip():
+    if not draft_id_s.isdigit() or not isinstance(text, str):
         return None
-    if len(text) > 4096:  # Telegram не примет такой ответ при отправке
+    # и пустота, и лимит считаются по видимому тексту: теги в счёт не идут
+    shown = visible_text(text, parse_mode)
+    if not shown.strip() or len(shown) > 4096:  # Telegram не примет такой ответ при отправке
         return None
-    return int(draft_id_s), text
+    return int(draft_id_s), text, parse_mode
 
 
 async def _repost_card(
@@ -316,7 +355,8 @@ async def _repost_card(
     text = _card_text(draft, _contact_name(conn, draft["chat_id"]))
     old_card_id = draft["card_message_id"]
     sent = await bot.send_message(
-        chat_id=owner_id, text=text, reply_markup=_card_markup(draft["id"], settings)
+        chat_id=owner_id, text=text, parse_mode=HTML,
+        reply_markup=_card_markup(draft["id"], settings),
     )
     db.set_draft_card(conn, draft["id"], sent.message_id)
     if old_card_id is None:
@@ -328,7 +368,8 @@ async def _repost_card(
         try:
             await bot.edit_message_text(
                 chat_id=owner_id, message_id=old_card_id,
-                text=text + "\n\n⏭ Заменён обновлённой карточкой", reply_markup=None,
+                text=text + "\n\n⏭ Заменён обновлённой карточкой",
+                parse_mode=HTML, reply_markup=None,
             )
         except Exception as exc:  # noqa: BLE001 - редактирование карточки не критично
             log.warning("не удалось отредактировать карточку черновика %s: %s", draft["id"], exc)
@@ -357,9 +398,9 @@ async def on_editor_result(
     if parsed is None:
         await msg.answer("Не удалось обработать данные редактора", reply_markup=ReplyKeyboardRemove())
         return
-    draft_id, text = parsed
+    draft_id, edited_text, parse_mode = parsed
 
-    if not db.update_draft_text(conn, draft_id, text):
+    if not db.update_draft_text(conn, draft_id, edited_text, parse_mode):
         # черновик ушёл из 'awaiting', пока редактор был открыт: остальные пути уборки
         # стоят за тем же гвардом, так что приглашение убрать больше некому
         stale = db.get_draft(conn, draft_id)

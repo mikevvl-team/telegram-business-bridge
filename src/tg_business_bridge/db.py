@@ -61,7 +61,8 @@ CREATE TABLE IF NOT EXISTS drafts (
     error TEXT,
     created_ts INTEGER NOT NULL,
     card_message_id INTEGER,
-    edit_prompt_message_id INTEGER
+    edit_prompt_message_id INTEGER,
+    parse_mode TEXT
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     text, content='messages', content_rowid='id', tokenize='unicode61'
@@ -108,9 +109,11 @@ def init_schema(conn: sqlite3.Connection) -> None:
     # БД, созданные до появления редактора черновиков, колонки не имеют — CREATE TABLE
     # IF NOT EXISTS их не обновит (r[1] — имя колонки в PRAGMA table_info)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(drafts)")}
-    if "edit_prompt_message_id" not in cols:
+    for name, decl in (("edit_prompt_message_id", "INTEGER"), ("parse_mode", "TEXT")):
+        if name in cols:
+            continue
         try:
-            conn.execute("ALTER TABLE drafts ADD COLUMN edit_prompt_message_id INTEGER")
+            conn.execute(f"ALTER TABLE drafts ADD COLUMN {name} {decl}")
         except sqlite3.OperationalError as e:
             # демон и MCP-сервер стартуют независимо: колонку мог добавить сосед
             if "duplicate column name" not in str(e):
@@ -208,10 +211,14 @@ def add_message_event(
     conn.commit()
 
 
-def create_draft(conn: sqlite3.Connection, chat_id: int, text: str, status: str) -> int:
+def create_draft(
+    conn: sqlite3.Connection, chat_id: int, text: str, status: str,
+    parse_mode: str | None = None,
+) -> int:
+    """parse_mode: None — обычный текст, 'HTML' — разметка Telegram HTML."""
     cur = conn.execute(
-        "INSERT INTO drafts (chat_id, text, status, created_ts) VALUES (?, ?, ?, ?)",
-        (chat_id, text, status, int(time.time())),
+        "INSERT INTO drafts (chat_id, text, status, created_ts, parse_mode) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, text, status, int(time.time()), parse_mode),
     )
     conn.commit()
     return cur.lastrowid
@@ -248,11 +255,14 @@ def set_draft_status_if(
     return cur.rowcount == 1
 
 
-def update_draft_text(conn: sqlite3.Connection, draft_id: int, text: str) -> bool:
-    """Заменяет текст черновика, пока тот ждёт решения владельца. False, если статус уже
-    не 'awaiting': правка не должна догонять отправленный или заменённый черновик."""
+def update_draft_text(
+    conn: sqlite3.Connection, draft_id: int, text: str, parse_mode: str | None = None,
+) -> bool:
+    """Заменяет текст и разметку черновика, пока тот ждёт решения владельца. False, если
+    статус уже не 'awaiting': правка не должна догонять отправленный или заменённый черновик."""
     cur = conn.execute(
-        "UPDATE drafts SET text=? WHERE id=? AND status='awaiting'", (text, draft_id)
+        "UPDATE drafts SET text=?, parse_mode=? WHERE id=? AND status='awaiting'",
+        (text, parse_mode, draft_id),
     )
     conn.commit()
     return cur.rowcount == 1
@@ -296,7 +306,8 @@ def recover_stale_sending(conn: sqlite3.Connection) -> int:
 def list_drafts(
     conn: sqlite3.Connection, chat_id: int | None = None, limit: int = 20,
 ) -> list[dict]:
-    sql = "SELECT id, chat_id, text, status, error, created_ts, card_message_id FROM drafts"
+    sql = ("SELECT id, chat_id, text, status, error, created_ts, card_message_id, parse_mode "
+           "FROM drafts")
     params: dict = {"limit": limit}
     if chat_id is not None:
         sql += " WHERE chat_id = :chat_id"

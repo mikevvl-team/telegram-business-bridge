@@ -152,7 +152,7 @@ async def test_reject_callback_edits_card(ready_conn, settings):  # noqa: F811
     cb = AsyncMock()
     cb.data = f"draft:{did}:reject"
     cb.message = AsyncMock()
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -170,7 +170,7 @@ async def test_approve_callback_edits_card(ready_conn, settings):  # noqa: F811
     cb = AsyncMock()
     cb.data = f"draft:{did}:approve"
     cb.message = AsyncMock()
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -231,7 +231,7 @@ async def test_approve_guard_rejects_when_status_changed_before_write(
     cb = AsyncMock()
     cb.data = f"draft:{did}:approve"
     cb.message = AsyncMock()
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -280,7 +280,7 @@ async def test_oversized_draft_fails_without_api_call(ready_conn, settings):  # 
 def test_card_text_bounded_with_long_contact_name():
     from tg_business_bridge.daemon.draft_handlers import _card_text
 
-    draft = {"chat_id": 777, "text": "y" * 5000}
+    draft = {"chat_id": 777, "text": "y" * 5000, "parse_mode": None}
     card = _card_text(draft, contact="Ы" * 4000)
     assert len(card) <= 3500
     assert "обрезано" in card
@@ -521,7 +521,7 @@ async def test_edit_callback_offers_editor_button(ready_conn, settings):  # noqa
     assert call.kwargs["chat_id"] == 42
     button = call.kwargs["reply_markup"].keyboard[0][0]
     assert button.web_app.url == (
-        f"{settings.editor_url}#id={did}&text={quote('текст с пробелами')}"
+        f"{settings.editor_url}#id={did}&html={quote('текст с пробелами')}"
     )
     cb.answer.assert_awaited()
 
@@ -609,7 +609,7 @@ async def test_editor_result_reposts_card_and_cleans_up(ready_conn, settings):  
     db.set_draft_card(ready_conn, did, 111)
     db.set_edit_prompt(ready_conn, did, 222)
     bot = _sending_bot(901, 902)  # 901 — сообщение-«ножницы», 902 — новая карточка
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "исправленный"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -639,7 +639,7 @@ async def test_editor_result_without_prompt_id_still_drops_keyboard(ready_conn, 
     # но клавиатура на экране точно есть — раз пришли данные редактора
     did = db.create_draft(ready_conn, 777, "старый", "awaiting")
     bot = _sending_bot(901, 902)
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "исправленный"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -664,7 +664,7 @@ async def test_editor_result_undeletable_card_is_marked_replaced(ready_conn, set
             raise RuntimeError("message can't be deleted")
 
     bot.delete_message.side_effect = delete
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "исправленный"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -693,7 +693,7 @@ async def test_editor_result_card_send_failure_keeps_old_card(ready_conn, settin
         raise RuntimeError("bot was blocked by the user")
 
     bot.send_message.side_effect = send
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "исправленный"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "исправленный"}))
 
     with pytest.raises(RuntimeError):
         await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
@@ -716,7 +716,7 @@ async def test_approve_callback_cleans_up_editor_prompt(ready_conn, settings):  
     cb = AsyncMock()
     cb.data = f"draft:{did}:approve"
     cb.message.chat.id = 42
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -735,7 +735,7 @@ async def test_reject_callback_cleans_up_editor_prompt(ready_conn, settings):  #
     cb = AsyncMock()
     cb.data = f"draft:{did}:reject"
     cb.message.chat.id = 42
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -757,7 +757,7 @@ async def test_stale_draft_callback_leaves_editor_prompt(ready_conn, settings, m
     cb = AsyncMock()
     cb.data = f"draft:{did}:reject"
     cb.message.chat.id = 42
-    cb.message.text = "Черновик ответа для X (chat 777):\n\nb"
+    cb.message.html_text = "Черновик ответа для X (chat 777):\n\nb"
 
     await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
 
@@ -770,7 +770,7 @@ async def test_stale_draft_callback_leaves_editor_prompt(ready_conn, settings, m
 async def test_editor_result_from_stranger_ignored(ready_conn, settings):  # noqa: F811
     did = db.create_draft(ready_conn, 777, "старый", "awaiting")
     bot = AsyncMock()
-    msg = _webapp_msg(999, json.dumps({"id": str(did), "text": "чужая правка"}))
+    msg = _webapp_msg(999, json.dumps({"id": str(did), "html": "чужая правка"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -787,12 +787,13 @@ async def test_editor_result_garbage_leaves_draft(ready_conn, settings):  # noqa
     payloads = [
         "не json",
         json.dumps({"id": str(did)}),                      # нет текста
-        json.dumps({"text": "правка"}),                    # нет id
-        json.dumps({"id": "abc", "text": "правка"}),       # id не число
-        json.dumps({"id": str(did), "text": "   "}),       # пустой текст
-        json.dumps({"id": str(did), "text": 5}),           # текст не строка
-        json.dumps({"id": str(did), "text": "x" * 4097}),  # длиннее лимита Telegram
-        json.dumps(["id", "text"]),                        # не объект
+        json.dumps({"html": "правка"}),                    # нет id
+        json.dumps({"id": "abc", "html": "правка"}),       # id не число
+        json.dumps({"id": str(did), "html": "   "}),       # пустой текст
+        json.dumps({"id": str(did), "html": "<b></b>"}),   # разметка без видимого текста
+        json.dumps({"id": str(did), "html": 5}),           # текст не строка
+        json.dumps({"id": str(did), "html": "x" * 4097}),  # длиннее лимита Telegram
+        json.dumps(["id", "html"]),                        # не объект
     ]
     for payload in payloads:
         msg = _webapp_msg(42, payload)
@@ -807,7 +808,7 @@ async def test_editor_result_garbage_leaves_draft(ready_conn, settings):  # noqa
 async def test_editor_result_on_non_awaiting_draft_rejected(ready_conn, settings):  # noqa: F811
     did = db.create_draft(ready_conn, 777, "старый", "approved")
     bot = AsyncMock()
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "поздняя правка"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "поздняя правка"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -826,7 +827,7 @@ async def test_editor_result_stale_draft_still_removes_prompt(ready_conn, settin
     did = db.create_draft(ready_conn, 777, "старый", "superseded")
     db.set_edit_prompt(ready_conn, did, 222)
     bot = AsyncMock()
-    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "поздняя правка"}))
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": "поздняя правка"}))
 
     await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
 
@@ -855,6 +856,7 @@ def test_init_schema_adds_edit_prompt_column(tmp_path):
 
     cols = {r[1] for r in raw.execute("PRAGMA table_info(drafts)")}
     assert "edit_prompt_message_id" in cols
+    assert "parse_mode" in cols
     raw.close()
 
 
@@ -914,3 +916,205 @@ def test_init_schema_reraises_other_operational_errors(tmp_path):
     with pytest.raises(sqlite3.OperationalError, match="database is locked"):
         db.init_schema(_ProxyConnection(raw, alter_error=locked))
     raw.close()
+
+
+_PRE_HTML_DRAFTS_SCHEMA = """CREATE TABLE drafts (
+    id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, text TEXT NOT NULL,
+    status TEXT NOT NULL, error TEXT, created_ts INTEGER NOT NULL,
+    card_message_id INTEGER, edit_prompt_message_id INTEGER)"""
+
+
+def test_init_schema_adds_parse_mode_to_existing_db(tmp_path):
+    # рабочая БД моста: редактор уже был, разметки ещё нет
+    raw = sqlite3.connect(tmp_path / "pre_html.db")
+    raw.execute(_PRE_HTML_DRAFTS_SCHEMA)
+    raw.execute(
+        "INSERT INTO drafts (chat_id, text, status, created_ts) VALUES (777, 'старый', 'awaiting', 1)"
+    )
+    raw.commit()
+
+    db.init_schema(raw)
+    db.init_schema(raw)  # повторный старт демона не должен падать
+
+    cols = [r[1] for r in raw.execute("PRAGMA table_info(drafts)")]
+    assert "parse_mode" in cols
+    row = raw.execute("SELECT * FROM drafts").fetchone()
+    assert row[cols.index("parse_mode")] is None  # старые черновики остаются обычным текстом
+    raw.close()
+
+
+def test_create_and_update_draft_carry_parse_mode(ready_conn):
+    did = db.create_draft(ready_conn, 777, "<b>привет</b>", "awaiting", "HTML")
+    assert db.get_draft(ready_conn, did)["parse_mode"] == "HTML"
+
+    plain = db.create_draft(ready_conn, 888, "привет", "awaiting")
+    assert db.get_draft(ready_conn, plain)["parse_mode"] is None
+
+    assert db.update_draft_text(ready_conn, plain, '<i>правка</i>', "HTML") is True
+    row = db.get_draft(ready_conn, plain)
+    assert row["text"] == "<i>правка</i>" and row["parse_mode"] == "HTML"
+
+    # правка без разметки сбрасывает parse_mode обратно
+    assert db.update_draft_text(ready_conn, did, "просто текст") is True
+    assert db.get_draft(ready_conn, did)["parse_mode"] is None
+
+
+@pytest.mark.asyncio
+async def test_html_draft_card_keeps_markup(ready_conn, settings):  # noqa: F811
+    link = '<a href="https://example.com/page">по ссылке</a>'
+    db.create_draft(ready_conn, 777, f"Подробности {link}", "pending", "HTML")
+    bot = AsyncMock()
+    bot.send_message.return_value.message_id = 555
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    call = bot.send_message.await_args
+    assert call.kwargs["parse_mode"] == "HTML"
+    assert link in call.kwargs["text"]  # разметка не экранирована
+
+
+@pytest.mark.asyncio
+async def test_plain_draft_card_escapes_markup(ready_conn, settings):  # noqa: F811
+    db.create_draft(ready_conn, 777, "1 < 2 & 3", "pending")
+    bot = AsyncMock()
+    bot.send_message.return_value.message_id = 555
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    call = bot.send_message.await_args
+    assert call.kwargs["parse_mode"] == "HTML"
+    assert "1 &lt; 2 &amp; 3" in call.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_html_draft_is_sent_with_parse_mode(ready_conn, settings):  # noqa: F811
+    html = '<b>привет</b>'
+    db.create_draft(ready_conn, 777, html, "approved", "HTML")
+    bot = AsyncMock()
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    call = bot.send_message.await_args
+    assert call.kwargs["text"] == html
+    assert call.kwargs["parse_mode"] == "HTML"
+
+
+@pytest.mark.asyncio
+async def test_long_html_draft_card_not_cut_inside_tag(ready_conn, settings):  # noqa: F811
+    db.create_draft(ready_conn, 777, "<b>" + "я" * 5000 + "</b>", "pending", "HTML")
+    bot = AsyncMock()
+    bot.send_message.return_value.message_id = 555
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    card = bot.send_message.await_args.kwargs["text"]
+    assert len(card) <= 3500
+    assert "обрезано" in card
+    assert "<" not in card  # обрезанное тело уходит без разметки, а не с рваным тегом
+
+
+@pytest.mark.asyncio
+async def test_oversize_counted_by_visible_text(ready_conn, settings):  # noqa: F811
+    # длинный href не мешает: лимит Telegram считается по видимому тексту
+    href = "https://example.com/" + "x" * 5000
+    did = db.create_draft(ready_conn, 777, f'<a href="{href}">коротко</a>', "approved", "HTML")
+    bot = AsyncMock()
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    assert db.get_draft(ready_conn, did)["status"] == "sent"
+
+
+@pytest.mark.asyncio
+async def test_edit_callback_url_carries_escaped_plain_text(ready_conn, settings):  # noqa: F811
+    # редактор всегда получает HTML — обычный текст экранируется заранее
+    did = db.create_draft(ready_conn, 777, "1 < 2", "awaiting")
+    bot = AsyncMock()
+    bot.send_message.return_value.message_id = 501
+    cb = AsyncMock()
+    cb.data = f"draft:{did}:edit"
+    cb.message.chat.id = 42
+
+    await on_draft_callback(cb, conn=ready_conn, bot=bot, settings=settings)
+
+    button = bot.send_message.await_args.kwargs["reply_markup"].keyboard[0][0]
+    assert button.web_app.url == f"{settings.editor_url}#id={did}&html={quote('1 &lt; 2')}"
+
+
+@pytest.mark.asyncio
+async def test_editor_result_marks_draft_html(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    bot = _sending_bot(901, 902)
+    edited = 'смотри <a href="https://example.com">тут</a>'
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": edited}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    row = db.get_draft(ready_conn, did)
+    assert row["text"] == edited
+    assert row["parse_mode"] == "HTML"
+    card = bot.send_message.await_args_list[1]
+    assert card.kwargs["parse_mode"] == "HTML"
+    assert edited in card.kwargs["text"]
+
+
+@pytest.mark.asyncio
+async def test_editor_result_accepts_long_href_with_short_text(ready_conn, settings):  # noqa: F811
+    # видимого текста мало, но исходник длиннее 4096 — правка должна пройти
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting")
+    href = "https://example.com/" + "x" * 5000
+    bot = _sending_bot(901, 902)
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "html": f'<a href="{href}">тут</a>'}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    assert db.get_draft(ready_conn, did)["parse_mode"] == "HTML"
+    assert href in db.get_draft(ready_conn, did)["text"]
+
+
+@pytest.mark.asyncio
+async def test_broken_html_card_marks_draft_failed(ready_conn, settings):  # noqa: F811
+    from aiogram.exceptions import TelegramBadRequest
+
+    # битая разметка от агента: повторять отправку карточки бессмысленно
+    did = db.create_draft(ready_conn, 777, "<b>незакрытый", "pending", "HTML")
+    bot = AsyncMock()
+    bot.send_message.side_effect = TelegramBadRequest(
+        method=AsyncMock(), message="can't parse entities: Unclosed start tag"
+    )
+
+    await process_new_drafts(bot, ready_conn, settings)
+
+    row = db.get_draft(ready_conn, did)
+    assert row["status"] == "failed"
+    assert "Unclosed start tag" in row["error"]
+
+    bot.send_message.reset_mock()
+    await process_new_drafts(bot, ready_conn, settings)
+    bot.send_message.assert_not_called()  # черновик закрыт, демон его больше не берёт
+
+
+def test_parse_editor_payload_accepts_both_protocols():
+    from tg_business_bridge.daemon.draft_handlers import _parse_editor_payload
+
+    assert _parse_editor_payload(json.dumps({"id": "7", "html": "<b>x</b>"})) == (
+        7, "<b>x</b>", "HTML"
+    )
+    # страница старой версии присылает text — её результат остаётся обычным текстом
+    assert _parse_editor_payload(json.dumps({"id": "7", "text": "1 < 2"})) == (7, "1 < 2", None)
+    assert _parse_editor_payload(json.dumps({"id": "7"})) is None
+
+
+@pytest.mark.asyncio
+async def test_editor_result_legacy_text_keeps_plain(ready_conn, settings):  # noqa: F811
+    did = db.create_draft(ready_conn, 777, "старый", "awaiting", "HTML")
+    bot = _sending_bot(901, 902)
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "1 < 2 и всё"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    row = db.get_draft(ready_conn, did)
+    assert row["text"] == "1 < 2 и всё"
+    assert row["parse_mode"] is None  # правка со старой страницы снимает разметку
+    card = bot.send_message.await_args_list[1]
+    assert "1 &lt; 2 и всё" in card.kwargs["text"]  # в карточке текст экранирован

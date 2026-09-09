@@ -277,3 +277,33 @@ def test_list_drafts_impl_truncates_preview(env):
     # "draft {id} (chat {chat_id}) [{status}] " + не более 80 символов превью
     preview = line.split("] ", 1)[1]
     assert len(preview) <= 80
+
+
+def test_draft_reply_html_flag_sets_parse_mode(env):
+    conn = mcp_server.get_conn()
+    mcp_server.draft_reply_impl(chat_id=777, text="привет")
+    mcp_server.draft_reply_impl(
+        chat_id=777, text='смотри <a href="https://example.com">тут</a>', html=True
+    )
+
+    modes = [r["parse_mode"] for r in conn.execute("SELECT parse_mode FROM drafts ORDER BY id")]
+    assert modes == [None, "HTML"]
+
+
+def test_send_reply_html_flag_sets_parse_mode(env):
+    conn = mcp_server.get_conn()
+    mcp_server.send_reply_impl(chat_id=555, text="<b>привет</b>", html=True)
+
+    row = conn.execute("SELECT status, parse_mode FROM drafts").fetchone()
+    assert row["status"] == "approved" and row["parse_mode"] == "HTML"
+
+
+def test_list_drafts_impl_marks_html_drafts(env):
+    conn = mcp_server.get_conn()
+    db.create_draft(conn, 777, "обычный", "pending")
+    db.create_draft(conn, 777, "<b>размеченный</b>", "pending", "HTML")
+
+    lines = mcp_server.list_drafts_impl().splitlines()
+
+    assert "[pending] [html]" in lines[0]  # новые первыми
+    assert "[html]" not in lines[1]

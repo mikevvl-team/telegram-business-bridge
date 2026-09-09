@@ -79,6 +79,8 @@ Telegram Business API
 
 - 7 MCP tools: `list_chats`, `get_history`, `search_messages`, `get_context`,
   `draft_reply`, `send_reply`, `list_drafts`.
+- Formatted replies: agents pass `html=True` to `draft_reply`/`send_reply` for
+  Telegram HTML (bold, italic, code, and links inside the text).
 - Draft approval cards (✅ Send / ✏️ Edit) with live status (⏳ Sending… → ✅ Sent /
   ⚠️ Failed); when a new draft arrives for the same chat, the older card is marked
   "⏭ Superseded by a newer draft".
@@ -187,9 +189,12 @@ build that memory on top of this bridge is described in [AGENTS.md](AGENTS.md).
 ## Editing drafts (Mini App)
 
 Pressing ✏️ Edit on a draft card sends you a keyboard button that opens a
-[Telegram Mini App](https://core.telegram.org/bots/webapps) — a plain editor
-window with the draft text. Fix the text, tap 💾 Save: the card re-renders with
-the new text and the same buttons, then ✅ Send when you are happy. You can edit
+[Telegram Mini App](https://core.telegram.org/bots/webapps) — an editor window
+with the draft text and formatting buttons: **B**, *I*, 🔗 Link and ✕ (drop
+formatting). A link wraps the selected words, so the reply reads as text with a
+link inside it, not as a bare URL on its own line. Fix the text, tap 💾 Save:
+the card re-renders with the new text and the same buttons, then ✅ Send when
+you are happy. You can edit
 as many times as you like; the draft stays yours until you send it.
 
 How it works under the hood — and why it is private:
@@ -214,10 +219,15 @@ else's page means trusting their JavaScript with your draft texts:
 2. Set `BRIDGE_EDITOR_URL=https://<you>.github.io/<repo>/editor.html` in `.env`
    and restart the daemon.
 
+The daemon and the editor page are updated together: if you host the page
+yourself, refresh your copy when you upgrade the daemon to this version —
+otherwise the editor opens empty.
+
 Set `BRIDGE_EDITOR_URL=` (empty) to disable editing — cards then show only
-✅ Send. Limits: Telegram caps the editor's return channel at 4096 bytes of
-JSON (roughly 2000 Cyrillic or 4000 Latin characters); the editor shows a live
-byte counter and refuses to save anything over the limit. On extremely long
+✅ Send. Limits: a message is capped at 4096 visible characters (the counter
+in the editor shows them; tags and link addresses do not count), and Telegram
+caps the editor's return channel at 4096 bytes of JSON — the editor refuses to
+save anything over either limit. On extremely long
 drafts the editor button may fail to open (button URL length) — the bot answers
 with an explicit error instead of hanging.
 
