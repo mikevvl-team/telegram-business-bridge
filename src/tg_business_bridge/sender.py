@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import sqlite3
 
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
@@ -9,6 +10,14 @@ from tg_business_bridge import db
 from tg_business_bridge.extract import extract_message_row
 
 log = logging.getLogger(__name__)
+
+
+def parse_mode_for(text: str) -> str | None:
+    # Скрытая ссылка передаётся HTML-тегом <a href=...>; включаем HTML-режим
+    # только когда он реально нужен, чтобы обычный текст не парсился как разметка.
+    if re.search(r'<a\s+href=', text, re.IGNORECASE):
+        return "HTML"
+    return None
 
 
 async def send_business_reply(bot, conn: sqlite3.Connection, chat_id: int, text: str) -> dict:
@@ -20,12 +29,17 @@ async def send_business_reply(bot, conn: sqlite3.Connection, chat_id: int, text:
         return {"ok": False, "error": "bot lacks can_reply right"}
 
     cid = connection["connection_id"]
+    mode = parse_mode_for(text)
     try:
         try:
-            sent = await bot.send_message(chat_id=chat_id, text=text, business_connection_id=cid)
+            sent = await bot.send_message(
+                chat_id=chat_id, text=text, business_connection_id=cid, parse_mode=mode
+            )
         except TelegramRetryAfter as e:
             await asyncio.sleep(e.retry_after)
-            sent = await bot.send_message(chat_id=chat_id, text=text, business_connection_id=cid)
+            sent = await bot.send_message(
+                chat_id=chat_id, text=text, business_connection_id=cid, parse_mode=mode
+            )
     # Ловим всю иерархию TelegramAPIError (BadRequest, Forbidden, сеть, 5xx, повторный
     # RetryAfter): иначе исключение уйдёт выше и черновик навсегда останется в 'sending'
     except TelegramAPIError as e:

@@ -5,7 +5,7 @@ from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import Message
 
 from tg_business_bridge import db
-from tg_business_bridge.sender import send_business_reply
+from tg_business_bridge.sender import parse_mode_for, send_business_reply
 from test_db import _msg
 
 
@@ -37,7 +37,7 @@ async def test_send_happy_path(ready_conn):
     res = await send_business_reply(bot, ready_conn, 777, "ответ")
     assert res == {"ok": True, "error": None}
     bot.send_message.assert_awaited_once_with(
-        chat_id=777, text="ответ", business_connection_id="c1"
+        chat_id=777, text="ответ", business_connection_id="c1", parse_mode=None
     )
     bot.read_business_message.assert_awaited_once_with(
         business_connection_id="c1", chat_id=777, message_id=10
@@ -127,3 +127,34 @@ async def test_second_retry_after_returns_error(ready_conn, monkeypatch):
     ]
     res = await send_business_reply(bot, ready_conn, 777, "x")
     assert res["ok"] is False  # повторный flood не должен пробрасываться исключением
+
+
+@pytest.mark.asyncio
+async def test_send_plain_text_no_parse_mode(ready_conn):
+    bot = AsyncMock()
+    bot.id = 99
+    bot.send_message.return_value = _sent_message()
+    res = await send_business_reply(bot, ready_conn, 777, "ответ")
+    assert res == {"ok": True, "error": None}
+    bot.send_message.assert_awaited_once_with(
+        chat_id=777, text="ответ", business_connection_id="c1", parse_mode=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_send_html_link_uses_html_parse_mode(ready_conn):
+    text = '<a href="https://x">слово</a>'
+    bot = AsyncMock()
+    bot.id = 99
+    bot.send_message.return_value = _sent_message(text=text)
+    res = await send_business_reply(bot, ready_conn, 777, text)
+    assert res == {"ok": True, "error": None}
+    bot.send_message.assert_awaited_once_with(
+        chat_id=777, text=text, business_connection_id="c1", parse_mode="HTML"
+    )
+
+
+def test_parse_mode_for():
+    assert parse_mode_for("обычный текст") is None
+    assert parse_mode_for('<a href="https://x">слово</a>') == "HTML"
+    assert parse_mode_for('<A HREF="https://x">слово</A>') == "HTML"

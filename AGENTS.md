@@ -61,6 +61,9 @@ Typical cycle: `list_chats` → `get_history`/`search_messages` → `get_context
   neighboring messages before and after, to understand the thread.
 - `draft_reply(chat_id, text)` — propose a reply on the owner's behalf. The
   primary way to answer.
+  Text is sent as plain text by default; to hide a link under a word, use
+  Telegram HTML: `<a href="URL">word</a>` — then escape `&`, `<`, `>` in the
+  rest of the text as `&amp;`, `&lt;`, `&gt;`.
 - `list_drafts(chat_id=None, limit=20)` — check a draft's fate. Statuses:
   pending (just created) → awaiting (card sent to the owner) →
   approved/sending (confirmed, being sent) → sent/failed. Also: rejected
