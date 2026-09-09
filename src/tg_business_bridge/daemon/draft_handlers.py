@@ -341,7 +341,8 @@ async def on_editor_result(
     connection = db.get_enabled_connection(conn)
     if connection is None or msg.from_user is None:
         return
-    if msg.from_user.id != connection["owner_id"]:
+    owner_id = connection["owner_id"]
+    if msg.from_user.id != owner_id:
         # правки чужих аккаунтов молча игнорируем: черновики видит только владелец
         log.warning("web_app_data от постороннего пользователя %s — пропущено", msg.from_user.id)
         return
@@ -359,10 +360,14 @@ async def on_editor_result(
     draft_id, text = parsed
 
     if not db.update_draft_text(conn, draft_id, text):
+        # черновик ушёл из 'awaiting', пока редактор был открыт: остальные пути уборки
+        # стоят за тем же гвардом, так что приглашение убрать больше некому
+        stale = db.get_draft(conn, draft_id)
+        if stale is not None:
+            await _forget_edit_prompt(bot, conn, owner_id, stale)
         await msg.answer("Черновик уже неактуален", reply_markup=ReplyKeyboardRemove())
         return
 
-    owner_id = connection["owner_id"]
     draft = db.get_draft(conn, draft_id)
     await _forget_edit_prompt(bot, conn, owner_id, draft)
     # клавиатуру снимаем безусловно: раз пришли данные редактора, она точно на экране,

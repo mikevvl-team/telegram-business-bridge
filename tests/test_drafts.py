@@ -819,6 +819,26 @@ async def test_editor_result_on_non_awaiting_draft_rejected(ready_conn, settings
     bot.send_message.assert_not_called()  # карточку не пересоздаём
 
 
+@pytest.mark.asyncio
+async def test_editor_result_stale_draft_still_removes_prompt(ready_conn, settings):  # noqa: F811
+    # черновик ушёл из awaiting, пока редактор был открыт: приглашение к нему
+    # больше никто не уберёт — остальные пути уборки стоят за гвардом awaiting
+    did = db.create_draft(ready_conn, 777, "старый", "superseded")
+    db.set_edit_prompt(ready_conn, did, 222)
+    bot = AsyncMock()
+    msg = _webapp_msg(42, json.dumps({"id": str(did), "text": "поздняя правка"}))
+
+    await on_editor_result(msg, conn=ready_conn, bot=bot, settings=settings)
+
+    row = db.get_draft(ready_conn, did)
+    assert row["text"] == "старый"
+    assert row["edit_prompt_message_id"] is None
+    assert bot.delete_message.await_args.kwargs["message_id"] == 222
+    answer = msg.answer.await_args
+    assert answer.args[0] == "Черновик уже неактуален"
+    assert isinstance(answer.kwargs["reply_markup"], ReplyKeyboardRemove)
+
+
 _OLD_DRAFTS_SCHEMA = """CREATE TABLE drafts (
     id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, text TEXT NOT NULL,
     status TEXT NOT NULL, error TEXT, created_ts INTEGER NOT NULL,
